@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Extracted installer contents (large binaries)
+extracted/
+MX-3100_Driver/
+
+# User profiles
+profiles/
+
+# IDE
+.vscode/
+*.code-workspace
