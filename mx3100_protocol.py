@@ -231,53 +231,38 @@ HID_KEY_NAMES = {
 # Reverse lookup: name -> HID code
 HID_NAME_TO_CODE = {v: k for k, v in HID_KEY_NAMES.items() if k != HID_KEY_NONE}
 
-# ─── Mouse button action types ──────────────────────────────────────────────
-# These define what a button does when pressed
+# ─── Mouse button action types (hardware values) ────────────────────────────
+# These are the actual byte[0] values in the 4-byte button format on the mouse.
+# Format: [btn_type, modifier, key_code, extra]
 
-ACTION_DEFAULT = 0x00       # Default mouse button function
-ACTION_KEYBOARD = 0x01      # Single keyboard key (with optional modifiers)
-ACTION_MOUSE_BUTTON = 0x02  # Mouse button (left/right/middle click)
-ACTION_MULTIMEDIA = 0x03    # Multimedia key (play, volume, etc.)
-ACTION_DPI = 0x04           # DPI control (DPI+, DPI-, DPI loop, specific stage)
-ACTION_MACRO = 0x05         # Macro playback
-ACTION_DISABLED = 0x06      # Button disabled
-ACTION_FIRE_KEY = 0x07      # Fire key (rapid repeat)
-ACTION_COMBO_KEY = 0x08     # Combo key (multiple simultaneous keys)
-ACTION_SNIPE_KEY = 0x09     # Snipe key (temporary DPI reduction)
-ACTION_SCROLL = 0x0A        # Scroll functions
-ACTION_PROFILE = 0x0B       # Profile switching
-ACTION_REPORT_RATE = 0x0C   # Report rate switching
+BTN_TYPE_KEYBOARD = 0x00    # Keyboard key (key_code=0 means disabled)
+BTN_TYPE_MOUSE = 0x01       # Mouse button (F0=LMB, F1=RMB, F2=MMB, etc.)
+BTN_TYPE_MULTIMEDIA = 0x03  # Consumer/multimedia key
+BTN_TYPE_DPI = 0x07         # DPI control / special
 
-# ─── Mouse button default functions ─────────────────────────────────────────
+# Backwards-compatible aliases used by the GUI
+ACTION_KEYBOARD = BTN_TYPE_KEYBOARD
+ACTION_MOUSE_BUTTON = BTN_TYPE_MOUSE
+ACTION_MULTIMEDIA = BTN_TYPE_MULTIMEDIA
+ACTION_DPI = BTN_TYPE_DPI
+ACTION_DISABLED = 0xFE   # GUI-only pseudo-type (stored as keyboard key=0)
+ACTION_DEFAULT = 0xFF    # GUI-only pseudo-type (restored to factory default)
 
-MOUSE_LEFT_CLICK = 0x01
-MOUSE_RIGHT_CLICK = 0x02
-MOUSE_MIDDLE_CLICK = 0x04
-MOUSE_BACK = 0x08
-MOUSE_FORWARD = 0x10
+# ─── Mouse button param codes (val byte for BTN_TYPE_MOUSE) ─────────────────
 
-# ─── DPI action sub-types ───────────────────────────────────────────────────
+MOUSE_LEFT_CLICK = 0xF0
+MOUSE_RIGHT_CLICK = 0xF1
+MOUSE_MIDDLE_CLICK = 0xF2
+MOUSE_BACK = 0xF5
+MOUSE_FORWARD = 0xF6
+MOUSE_SCROLL_UP = 0xF7
+MOUSE_SCROLL_DOWN = 0xF8
+
+# ─── DPI action sub-types (val byte for BTN_TYPE_DPI) ───────────────────────
 
 DPI_PLUS = 0x01
 DPI_MINUS = 0x02
 DPI_LOOP = 0x03
-DPI_STAGE_1 = 0x11
-DPI_STAGE_2 = 0x12
-DPI_STAGE_3 = 0x13
-DPI_STAGE_4 = 0x14
-DPI_STAGE_5 = 0x15
-DPI_STAGE_6 = 0x16
-DPI_STAGE_7 = 0x17
-DPI_STAGE_8 = 0x18
-
-# ─── Scroll action sub-types ────────────────────────────────────────────────
-
-SCROLL_UP = 0x01
-SCROLL_DOWN = 0x02
-SCROLL_LEFT = 0x03
-SCROLL_RIGHT = 0x04
-SCROLL_SCREEN = 0x05
-SCROLL_UNIVERSAL = 0x06
 
 # ─── Multimedia key codes (HID Consumer Usage Page 0x0C) ────────────────────
 
@@ -295,82 +280,99 @@ MEDIA_MAIL = 0x018A
 MEDIA_CALCULATOR = 0x0192
 MEDIA_MY_COMPUTER = 0x0194
 
-# ─── Button info ─────────────────────────────────────────────────────────────
+# ─── Button info (19 buttons, matching factory default order) ────────────────
 
 BUTTON_NAMES = {
     0:  "Button 1 (Left Click)",
     1:  "Button 2 (Right Click)",
-    2:  "Button 3 (Scroll Click)",
-    3:  "Button 4 (Scroll Right Tilt)",
-    4:  "Button 5 (Scroll Left Tilt)",
-    5:  "Button 6 (DPI+)",
-    6:  "Button 7 (DPI-)",
-    7:  "Side Button S1",
-    8:  "Side Button S2",
-    9:  "Side Button S3",
-    10: "Side Button S4",
-    11: "Side Button S5",
-    12: "Side Button S6",
-    13: "Side Button S7",
-    14: "Side Button S8",
-    15: "Side Button S9",
-    16: "Side Button S10",
-    17: "Side Button S11",
-    18: "Side Button S12",
+    2:  "Button 3 (Middle Click)",
+    3:  "Button 4 (DPI+)",
+    4:  "Button 5 (DPI-)",
+    5:  "Button 6 (Back)",
+    6:  "Button 7 (Forward)",
+    7:  "Button 8 (Unassigned)",
+    8:  "Button 9",
+    9:  "Button 10",
+    10: "Button 11",
+    11: "Button 12",
+    12: "Button 13",
+    13: "Button 14",
+    14: "Button 15 (Scroll Up)",
+    15: "Button 16 (Scroll Down)",
+    16: "Button 17",
+    17: "Button 18",
+    18: "Button 19",
 }
 
 TOTAL_BUTTONS = 19
 
+# ─── Protocol constants ─────────────────────────────────────────────────────
+
+CMD_MSG_LEN = 8
+DATA_LINE_LEN = 64
+SECTION_LEN = DATA_LINE_LEN * 2  # 128 bytes per section
+
+CONFIGS_ADDR = 0x73   # Settings section (DPI, LED, sensitivity)
+BUTTONS_ADDR = 0x72   # Button mapping section
+MACRO_ADDR_START = 0x6F  # Macros (descending addresses)
+
+SETTINGS_ADDR_MAX = 0x73
+SETTINGS_ADDR_PARITY = 0x0C
+ADDR_READ = 0x80      # Bit 7 set = read operation
+BUTTON_ENTRY_SIZE = 4  # 4 bytes per button in hardware
+
 # ─── Action type names ───────────────────────────────────────────────────────
 
 ACTION_NAMES = {
-    ACTION_DEFAULT: "Default",
-    ACTION_KEYBOARD: "Keyboard Key",
-    ACTION_MOUSE_BUTTON: "Mouse Button",
-    ACTION_MULTIMEDIA: "Multimedia",
-    ACTION_DPI: "DPI Control",
-    ACTION_MACRO: "Macro",
+    BTN_TYPE_KEYBOARD: "Keyboard Key",
+    BTN_TYPE_MOUSE: "Mouse Button",
+    BTN_TYPE_MULTIMEDIA: "Multimedia",
+    BTN_TYPE_DPI: "DPI Control",
     ACTION_DISABLED: "Disabled",
-    ACTION_FIRE_KEY: "Fire Key",
-    ACTION_COMBO_KEY: "Combo Key",
-    ACTION_SNIPE_KEY: "Snipe Key",
-    ACTION_SCROLL: "Scroll",
-    ACTION_PROFILE: "Profile Switch",
-    ACTION_REPORT_RATE: "Report Rate",
+    ACTION_DEFAULT: "Default",
 }
 
 
 class ButtonConfig:
-    """Represents a single button's configuration."""
+    """Represents a single button's 4-byte hardware configuration.
 
-    def __init__(self, action_type=ACTION_DEFAULT, modifier=0, key_code=0,
-                 extra1=0, extra2=0):
-        self.action_type = action_type
+    Wire format: [btn_type, modifier, key_code, extra]
+      btn_type:  0x00=keyboard, 0x01=mouse, 0x03=multimedia, 0x07=DPI
+      modifier:  HID modifier bitmask (for keyboard type)
+      key_code:  HID usage code, mouse button code, or consumer code
+      extra:     usually 0x00
+    """
+
+    def __init__(self, btn_type=BTN_TYPE_KEYBOARD, modifier=0, key_code=0,
+                 extra=0):
+        self.btn_type = btn_type
         self.modifier = modifier
         self.key_code = key_code
-        self.extra1 = extra1
-        self.extra2 = extra2
+        self.extra = extra
 
     def to_bytes(self):
-        return bytes([self.action_type, self.modifier, self.key_code,
-                      self.extra1, self.extra2])
+        return bytes([self.btn_type, self.modifier, self.key_code, self.extra])
 
     @classmethod
     def from_bytes(cls, data):
-        if len(data) < 5:
-            data = data + bytes(5 - len(data))
-        return cls(data[0], data[1], data[2], data[3], data[4])
+        if len(data) < 4:
+            data = list(data) + [0] * (4 - len(data))
+        return cls(data[0], data[1], data[2], data[3])
+
+    def is_disabled(self):
+        return self.btn_type == BTN_TYPE_KEYBOARD and self.key_code == 0 and self.modifier == 0
 
     def describe(self):
         """Human-readable description of button config."""
-        if self.action_type == ACTION_DEFAULT:
-            return "Default"
-        elif self.action_type == ACTION_KEYBOARD:
+        if self.is_disabled():
+            return "Disabled"
+
+        if self.btn_type == BTN_TYPE_KEYBOARD:
             parts = []
-            if self.modifier & HID_MOD_LCTRL:  parts.append("LCtrl")
-            if self.modifier & HID_MOD_LSHIFT: parts.append("LShift")
-            if self.modifier & HID_MOD_LALT:   parts.append("LAlt")
-            if self.modifier & HID_MOD_LGUI:   parts.append("LWin")
+            if self.modifier & HID_MOD_LCTRL:  parts.append("Ctrl")
+            if self.modifier & HID_MOD_LSHIFT: parts.append("Shift")
+            if self.modifier & HID_MOD_LALT:   parts.append("Alt")
+            if self.modifier & HID_MOD_LGUI:   parts.append("Win")
             if self.modifier & HID_MOD_RCTRL:  parts.append("RCtrl")
             if self.modifier & HID_MOD_RSHIFT: parts.append("RShift")
             if self.modifier & HID_MOD_RALT:   parts.append("RAlt")
@@ -378,27 +380,42 @@ class ButtonConfig:
             key_name = HID_KEY_NAMES.get(self.key_code, f"0x{self.key_code:02X}")
             parts.append(key_name)
             return " + ".join(parts)
-        elif self.action_type == ACTION_DISABLED:
-            return "Disabled"
-        elif self.action_type == ACTION_DPI:
-            dpi_names = {
-                DPI_PLUS: "DPI+", DPI_MINUS: "DPI-", DPI_LOOP: "DPI Loop",
+
+        elif self.btn_type == BTN_TYPE_MOUSE:
+            mouse_names = {
+                MOUSE_LEFT_CLICK: "Left Click",
+                MOUSE_RIGHT_CLICK: "Right Click",
+                MOUSE_MIDDLE_CLICK: "Middle Click",
+                MOUSE_BACK: "Back",
+                MOUSE_FORWARD: "Forward",
+                MOUSE_SCROLL_UP: "Scroll Up",
+                MOUSE_SCROLL_DOWN: "Scroll Down",
             }
-            for i in range(1, 9):
-                dpi_names[0x10 + i] = f"DPI Stage {i}"
+            return mouse_names.get(self.key_code, f"Mouse 0x{self.key_code:02X}")
+
+        elif self.btn_type == BTN_TYPE_MULTIMEDIA:
+            media_names = {
+                MEDIA_PLAY_PAUSE: "Play/Pause",
+                MEDIA_STOP: "Stop",
+                MEDIA_NEXT: "Next Track",
+                MEDIA_PREV: "Previous Track",
+                MEDIA_VOLUME_UP: "Volume Up",
+                MEDIA_VOLUME_DOWN: "Volume Down",
+                MEDIA_MUTE: "Mute",
+            }
+            return media_names.get(self.key_code, f"Media 0x{self.key_code:02X}")
+
+        elif self.btn_type == BTN_TYPE_DPI:
+            dpi_names = {DPI_PLUS: "DPI+", DPI_MINUS: "DPI-", DPI_LOOP: "DPI Loop"}
             return dpi_names.get(self.key_code, f"DPI 0x{self.key_code:02X}")
-        elif self.action_type == ACTION_MOUSE_BUTTON:
-            names = {1: "Left Click", 2: "Right Click", 4: "Middle Click",
-                     8: "Back", 16: "Forward"}
-            return names.get(self.key_code, f"Mouse 0x{self.key_code:02X}")
+
         else:
-            name = ACTION_NAMES.get(self.action_type, f"Type 0x{self.action_type:02X}")
-            return f"{name} (0x{self.key_code:02X})"
+            return f"Type 0x{self.btn_type:02X} Code 0x{self.key_code:02X}"
 
     @classmethod
     def keyboard_key(cls, hid_code, modifier=0):
         """Create a keyboard key assignment."""
-        return cls(ACTION_KEYBOARD, modifier, hid_code)
+        return cls(BTN_TYPE_KEYBOARD, modifier, hid_code)
 
     @classmethod
     def f_key(cls, n, modifier=0):
@@ -409,31 +426,56 @@ class ButtonConfig:
             code = 0x5B + n  # F13=0x68, F24=0x73
         else:
             raise ValueError(f"F{n} is not a valid function key (1-24)")
-        return cls(ACTION_KEYBOARD, modifier, code)
+        return cls(BTN_TYPE_KEYBOARD, modifier, code)
+
+    @classmethod
+    def mouse_button(cls, button_code):
+        """Create a mouse button assignment."""
+        return cls(BTN_TYPE_MOUSE, 0, button_code)
+
+    @classmethod
+    def multimedia(cls, consumer_code):
+        """Create a multimedia key assignment."""
+        return cls(BTN_TYPE_MULTIMEDIA, 0, consumer_code)
+
+    @classmethod
+    def dpi(cls, action):
+        """Create a DPI control assignment."""
+        return cls(BTN_TYPE_DPI, 0, action)
 
     @classmethod
     def disabled(cls):
-        return cls(ACTION_DISABLED)
+        return cls(BTN_TYPE_KEYBOARD, 0, 0)
 
     @classmethod
     def default(cls):
-        return cls(ACTION_DEFAULT)
+        """Return a disabled config (caller should use DEFAULT_BUTTONS for actual defaults)."""
+        return cls(BTN_TYPE_KEYBOARD, 0, 0)
 
 
-# ─── Default button assignments ──────────────────────────────────────────────
+# ─── Factory default button assignments (from live hardware read) ────────────
 
 DEFAULT_BUTTONS = {
-    0: ButtonConfig(ACTION_MOUSE_BUTTON, 0, MOUSE_LEFT_CLICK),   # Left click
-    1: ButtonConfig(ACTION_MOUSE_BUTTON, 0, MOUSE_RIGHT_CLICK),  # Right click
-    2: ButtonConfig(ACTION_SCROLL, 0, SCROLL_UNIVERSAL),          # Scroll click
-    3: ButtonConfig(ACTION_SCROLL, 0, SCROLL_RIGHT),              # Scroll right tilt
-    4: ButtonConfig(ACTION_SCROLL, 0, SCROLL_LEFT),               # Scroll left tilt
-    5: ButtonConfig(ACTION_DPI, 0, DPI_PLUS),                     # DPI+
-    6: ButtonConfig(ACTION_DPI, 0, DPI_MINUS),                    # DPI-
+    0:  ButtonConfig(BTN_TYPE_MOUSE, 0, MOUSE_LEFT_CLICK),      # Left click
+    1:  ButtonConfig(BTN_TYPE_MOUSE, 0, MOUSE_RIGHT_CLICK),     # Right click
+    2:  ButtonConfig(BTN_TYPE_MOUSE, 0, MOUSE_MIDDLE_CLICK),    # Middle click
+    3:  ButtonConfig(BTN_TYPE_DPI, 0, DPI_PLUS),                # DPI+
+    4:  ButtonConfig(BTN_TYPE_DPI, 0, DPI_MINUS),               # DPI-
+    5:  ButtonConfig(BTN_TYPE_MOUSE, 0, MOUSE_BACK),            # Back
+    6:  ButtonConfig(BTN_TYPE_MOUSE, 0, MOUSE_FORWARD),         # Forward
+    7:  ButtonConfig.disabled(),                                  # Unassigned
+    8:  ButtonConfig.disabled(),
+    9:  ButtonConfig.disabled(),
+    10: ButtonConfig.disabled(),
+    11: ButtonConfig.disabled(),
+    12: ButtonConfig.disabled(),
+    13: ButtonConfig.disabled(),
+    14: ButtonConfig(BTN_TYPE_MOUSE, 0, MOUSE_SCROLL_UP),       # Scroll up
+    15: ButtonConfig(BTN_TYPE_MOUSE, 0, MOUSE_SCROLL_DOWN),     # Scroll down
+    16: ButtonConfig.disabled(),
+    17: ButtonConfig.disabled(),
+    18: ButtonConfig.disabled(),
 }
-# Side buttons S1-S12 default to disabled
-for i in range(7, TOTAL_BUTTONS):
-    DEFAULT_BUTTONS[i] = ButtonConfig.disabled()
 
 
 def get_all_assignable_keys():

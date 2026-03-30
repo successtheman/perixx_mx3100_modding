@@ -28,19 +28,24 @@ from tkinter import ttk, messagebox, filedialog
 
 from mx3100_hid import enumerate_devices, MX3100Device
 from mx3100_protocol import (
-    BUTTON_NAMES, TOTAL_BUTTONS, ACTION_NAMES,
-    ACTION_DEFAULT, ACTION_KEYBOARD, ACTION_MOUSE_BUTTON, ACTION_MULTIMEDIA,
-    ACTION_DPI, ACTION_MACRO, ACTION_DISABLED, ACTION_FIRE_KEY,
-    ACTION_COMBO_KEY, ACTION_SNIPE_KEY, ACTION_SCROLL, ACTION_PROFILE,
-    ACTION_REPORT_RATE,
+    BUTTON_NAMES, TOTAL_BUTTONS, ACTION_NAMES, BUTTON_ENTRY_SIZE,
+    BTN_TYPE_KEYBOARD, BTN_TYPE_MOUSE, BTN_TYPE_MULTIMEDIA, BTN_TYPE_DPI,
+    ACTION_KEYBOARD, ACTION_MOUSE_BUTTON, ACTION_MULTIMEDIA, ACTION_DPI,
+    ACTION_DISABLED, ACTION_DEFAULT,
     MOUSE_LEFT_CLICK, MOUSE_RIGHT_CLICK, MOUSE_MIDDLE_CLICK,
-    MOUSE_BACK, MOUSE_FORWARD,
+    MOUSE_BACK, MOUSE_FORWARD, MOUSE_SCROLL_UP, MOUSE_SCROLL_DOWN,
     DPI_PLUS, DPI_MINUS, DPI_LOOP,
     HID_KEY_NAMES, HID_NAME_TO_CODE, HID_KEY_NONE,
     HID_MOD_LCTRL, HID_MOD_LSHIFT, HID_MOD_LALT, HID_MOD_LGUI,
     HID_MOD_RCTRL, HID_MOD_RSHIFT, HID_MOD_RALT, HID_MOD_RGUI,
+    MEDIA_PLAY_PAUSE, MEDIA_STOP, MEDIA_NEXT, MEDIA_PREV,
+    MEDIA_VOLUME_UP, MEDIA_VOLUME_DOWN, MEDIA_MUTE,
     ButtonConfig, get_all_assignable_keys, get_function_keys,
     DEFAULT_BUTTONS,
+    # Protocol constants
+    CMD_MSG_LEN, DATA_LINE_LEN, SECTION_LEN,
+    CONFIGS_ADDR, BUTTONS_ADDR,
+    SETTINGS_ADDR_MAX, SETTINGS_ADDR_PARITY, ADDR_READ,
 )
 
 PROFILE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "profiles")
@@ -53,11 +58,10 @@ def save_profile(filename, buttons):
     data = {}
     for btn_idx, cfg in buttons.items():
         data[str(btn_idx)] = {
-            "action_type": cfg.action_type,
+            "btn_type": cfg.btn_type,
             "modifier": cfg.modifier,
             "key_code": cfg.key_code,
-            "extra1": cfg.extra1,
-            "extra2": cfg.extra2,
+            "extra": cfg.extra,
         }
     os.makedirs(os.path.dirname(filename) if os.path.dirname(filename) else ".", exist_ok=True)
     with open(filename, "w") as f:
@@ -72,108 +76,101 @@ def load_profile(filename):
     for btn_idx_str, cfg_data in data.items():
         btn_idx = int(btn_idx_str)
         buttons[btn_idx] = ButtonConfig(
-            cfg_data["action_type"],
-            cfg_data["modifier"],
-            cfg_data["key_code"],
-            cfg_data.get("extra1", 0),
-            cfg_data.get("extra2", 0),
+            cfg_data.get("btn_type", cfg_data.get("action_type", 0)),
+            cfg_data.get("modifier", 0),
+            cfg_data.get("key_code", 0),
+            cfg_data.get("extra", cfg_data.get("extra1", 0)),
         )
     return buttons
 
 
-# ─── HID Protocol Layer ─────────────────────────────────────────────────────
-# NOTE: The exact report format must be discovered using the sniffer tool
-# with the actual hardware. The functions below implement the most common
-# Holtek mouse configuration protocol. If your mouse uses a different
-# report structure, update these functions after running the sniffer.
+# ─── HID Protocol Layer (from pzl/mx3100drv, confirmed working) ─────────────
+# Protocol uses 9-byte Feature Reports for commands, and 64-byte Output/Input
+# reports for data transfer. Communication is via Interface #2 (mi_02),
+# UsagePage 0xFF00 (vendor-specific).
+#
+# Startup: Two feature report commands to initialize the mouse.
+# Read: send feature cmd → read feature ACK → read 2×64 byte data
+# Write: send feature cmd → write 2×64 byte data
 
-# Common Holtek report IDs for gaming mice:
-REPORT_ID_CONFIG = 0x07     # Configuration read/write
-CMD_READ_BUTTONS = 0x05     # Read button assignments
-CMD_WRITE_BUTTONS = 0x06    # Write button assignments
-CMD_READ_DPI = 0x03         # Read DPI settings
-CMD_WRITE_DPI = 0x04        # Write DPI settings
-CMD_SAVE = 0x09             # Save to flash
-
-# Size of each button entry in the report
-BUTTON_ENTRY_SIZE = 5
+STARTUP_CMD_1 = [0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFD]
+STARTUP_CMD_2 = [0x03, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0xFA]
 
 
-def build_write_report(profile_idx, buttons, feature_len):
-    """Build a feature report to write button assignments to the mouse.
+def send_startup(dev):
+    """Send the two startup commands to initialize communication."""
+    dev.send_feature(STARTUP_CMD_1)
+    dev.send_feature(STARTUP_CMD_2)
 
-    Protocol (typical Holtek):
-      Byte 0: Report ID (0x07)
-      Byte 1: Command (0x06 = write buttons)
-      Byte 2: Profile index (0-5)
-      Byte 3: Number of buttons
-      Byte 4+: Button data (5 bytes per button)
+
+def read_section(dev, addr):
+    """Read a 128-byte section from mouse memory.
+    Returns list of 128 bytes, or None on failure.
     """
-    report = bytearray(feature_len)
-    report[0] = REPORT_ID_CONFIG
-    report[1] = CMD_WRITE_BUTTONS
-    report[2] = profile_idx
-    report[3] = TOTAL_BUTTONS
+    cmd = [0] * CMD_MSG_LEN
+    cmd[7] = addr
+    cmd[0] = ADDR_READ | (SETTINGS_ADDR_MAX - addr + SETTINGS_ADDR_PARITY)
 
-    offset = 4
-    for btn_idx in range(TOTAL_BUTTONS):
-        cfg = buttons.get(btn_idx, ButtonConfig.default())
-        btn_bytes = cfg.to_bytes()
-        for j, b in enumerate(btn_bytes):
-            if offset + j < feature_len:
-                report[offset + j] = b
-        offset += BUTTON_ENTRY_SIZE
+    dev.send_feature(cmd)
+    dev.read_feature()  # ACK
 
-    return list(report)
+    data1 = dev.read_data()
+    if data1 is None:
+        return None
+    data2 = dev.read_data()
+    if data2 is None:
+        return None
+    return data1 + data2
 
 
-def build_save_report(feature_len):
-    """Build a report to tell the mouse to save settings to flash."""
-    report = bytearray(feature_len)
-    report[0] = REPORT_ID_CONFIG
-    report[1] = CMD_SAVE
-    return list(report)
+def write_section(dev, addr, data_128bytes):
+    """Write a 128-byte section to mouse memory."""
+    cmd = [0] * CMD_MSG_LEN
+    cmd[7] = addr
+    cmd[0] = SETTINGS_ADDR_MAX - addr + SETTINGS_ADDR_PARITY
+    cmd[2] = SECTION_LEN  # 128
+
+    dev.send_feature(cmd)
+    dev.write_data(data_128bytes[:DATA_LINE_LEN])
+    dev.write_data(data_128bytes[DATA_LINE_LEN:SECTION_LEN])
 
 
-def parse_button_report(data):
-    """Parse a button configuration report read from the mouse."""
+def parse_buttons_from_section(data):
+    """Parse 19 buttons from a 128-byte button section."""
     buttons = {}
-    if len(data) < 4:
-        return buttons
-
-    num_buttons = data[3] if data[3] <= TOTAL_BUTTONS else TOTAL_BUTTONS
-    offset = 4
-    for btn_idx in range(num_buttons):
+    for i in range(TOTAL_BUTTONS):
+        offset = i * BUTTON_ENTRY_SIZE
         if offset + BUTTON_ENTRY_SIZE <= len(data):
             cfg = ButtonConfig.from_bytes(data[offset:offset + BUTTON_ENTRY_SIZE])
-            buttons[btn_idx] = cfg
-        offset += BUTTON_ENTRY_SIZE
-
+            buttons[i] = cfg
     return buttons
 
 
-def read_buttons_from_device(dev, profile_idx=0):
+def build_button_section(buttons):
+    """Build a 128-byte section from button configs."""
+    data = bytearray(SECTION_LEN)
+    for btn_idx in range(TOTAL_BUTTONS):
+        cfg = buttons.get(btn_idx, ButtonConfig.disabled())
+        offset = btn_idx * BUTTON_ENTRY_SIZE
+        btn_bytes = cfg.to_bytes()
+        data[offset:offset + BUTTON_ENTRY_SIZE] = btn_bytes
+    return list(data)
+
+
+def read_buttons_from_device(dev):
     """Read current button configuration from the mouse."""
-    # Send read command
-    report = bytearray(dev.feature_report_len)
-    report[0] = REPORT_ID_CONFIG
-    report[1] = CMD_READ_BUTTONS
-    report[2] = profile_idx
-    dev.set_feature(list(report))
-
-    # Read response
-    data = dev.get_feature(REPORT_ID_CONFIG, dev.feature_report_len)
-    return parse_button_report(data)
+    send_startup(dev)
+    section = read_section(dev, BUTTONS_ADDR)
+    if section is None:
+        return {}
+    return parse_buttons_from_section(section)
 
 
-def write_buttons_to_device(dev, profile_idx, buttons):
+def write_buttons_to_device(dev, buttons):
     """Write button configuration to the mouse."""
-    report = build_write_report(profile_idx, buttons, dev.feature_report_len)
-    dev.set_feature(report)
-
-    # Save to flash
-    save_report = build_save_report(dev.feature_report_len)
-    dev.set_feature(save_report)
+    send_startup(dev)
+    section = build_button_section(buttons)
+    write_section(dev, BUTTONS_ADDR, section)
 
 
 # ─── GUI Application ────────────────────────────────────────────────────────
@@ -198,13 +195,11 @@ class ButtonAssignmentDialog(tk.Toplevel):
 
         self.action_var = tk.StringVar(value="keyboard")
         actions = [
-            ("Keyboard Key (Single)", "keyboard"),
-            ("Keyboard Combo", "combo"),
+            ("Keyboard Key", "keyboard"),
             ("Mouse Button", "mouse"),
             ("DPI Control", "dpi"),
             ("Multimedia", "media"),
             ("Disabled", "disabled"),
-            ("Default", "default"),
         ]
         for text, val in actions:
             ttk.Radiobutton(type_frame, text=text, variable=self.action_var,
@@ -289,45 +284,11 @@ class ButtonAssignmentDialog(tk.Toplevel):
         ttk.Label(fkey_frame, text="(Green = F13-F24, newly supported!)",
                   foreground="green").pack(anchor="w")
 
-    def _build_combo_options(self):
-        self._clear_options()
-
-        # Modifiers (same as keyboard)
-        mod_frame = ttk.Frame(self.options_frame)
-        mod_frame.pack(fill="x", pady=2)
-        ttk.Label(mod_frame, text="Modifiers:").pack(side="left")
-
-        self.mod_lctrl = tk.BooleanVar()
-        self.mod_lshift = tk.BooleanVar()
-        self.mod_lalt = tk.BooleanVar()
-        self.mod_lwin = tk.BooleanVar()
-
-        ttk.Checkbutton(mod_frame, text="Ctrl", variable=self.mod_lctrl).pack(side="left", padx=3)
-        ttk.Checkbutton(mod_frame, text="Shift", variable=self.mod_lshift).pack(side="left", padx=3)
-        ttk.Checkbutton(mod_frame, text="Alt", variable=self.mod_lalt).pack(side="left", padx=3)
-        ttk.Checkbutton(mod_frame, text="Win", variable=self.mod_lwin).pack(side="left", padx=3)
-
-        # Key selection
-        key_frame = ttk.Frame(self.options_frame)
-        key_frame.pack(fill="x", pady=5)
-        ttk.Label(key_frame, text="Key:").pack(side="left")
-
-        self.key_var = tk.StringVar()
-        all_keys = get_all_assignable_keys()
-        key_names = [name for name, _ in all_keys]
-
-        self.key_combo = ttk.Combobox(key_frame, textvariable=self.key_var,
-                                       values=key_names, state="readonly", width=20)
-        self.key_combo.pack(side="left", padx=5)
-
-        ttk.Label(self.options_frame,
-                  text="A combo key sends the modifier(s) + key simultaneously.",
-                  wraplength=400).pack(pady=5)
-
     def _build_mouse_options(self):
         self._clear_options()
         self.mouse_var = tk.StringVar(value="Left Click")
-        options = ["Left Click", "Right Click", "Middle Click", "Back", "Forward"]
+        options = ["Left Click", "Right Click", "Middle Click", "Back", "Forward",
+                   "Scroll Up", "Scroll Down"]
         for opt in options:
             ttk.Radiobutton(self.options_frame, text=opt, variable=self.mouse_var,
                             value=opt).pack(anchor="w")
@@ -335,7 +296,7 @@ class ButtonAssignmentDialog(tk.Toplevel):
     def _build_dpi_options(self):
         self._clear_options()
         self.dpi_var = tk.StringVar(value="DPI+")
-        options = ["DPI+", "DPI-", "DPI Loop"] + [f"DPI Stage {i}" for i in range(1, 9)]
+        options = ["DPI+", "DPI-", "DPI Loop"]
         for opt in options:
             ttk.Radiobutton(self.options_frame, text=opt, variable=self.dpi_var,
                             value=opt).pack(anchor="w")
@@ -351,18 +312,12 @@ class ButtonAssignmentDialog(tk.Toplevel):
 
     def _build_empty_options(self):
         self._clear_options()
-        action = self.action_var.get()
-        if action == "disabled":
-            ttk.Label(self.options_frame, text="This button will be disabled.").pack()
-        elif action == "default":
-            ttk.Label(self.options_frame, text="This button will use its default function.").pack()
+        ttk.Label(self.options_frame, text="This button will be disabled.").pack()
 
     def _update_options(self):
         action = self.action_var.get()
         if action == "keyboard":
             self._build_keyboard_options()
-        elif action == "combo":
-            self._build_combo_options()
         elif action == "mouse":
             self._build_mouse_options()
         elif action == "dpi":
@@ -374,7 +329,10 @@ class ButtonAssignmentDialog(tk.Toplevel):
 
     def _set_from_config(self, cfg):
         """Populate dialog from existing ButtonConfig."""
-        if cfg.action_type == ACTION_KEYBOARD:
+        if cfg.is_disabled():
+            self.action_var.set("disabled")
+            self._update_options()
+        elif cfg.btn_type == BTN_TYPE_KEYBOARD:
             self.action_var.set("keyboard")
             self._update_options()
             self.mod_lctrl.set(bool(cfg.modifier & HID_MOD_LCTRL))
@@ -384,40 +342,26 @@ class ButtonAssignmentDialog(tk.Toplevel):
             key_name = HID_KEY_NAMES.get(cfg.key_code, "")
             if key_name:
                 self.key_var.set(key_name)
-        elif cfg.action_type == ACTION_COMBO_KEY:
-            self.action_var.set("combo")
-            self._update_options()
-            self.mod_lctrl.set(bool(cfg.modifier & HID_MOD_LCTRL))
-            self.mod_lshift.set(bool(cfg.modifier & HID_MOD_LSHIFT))
-            self.mod_lalt.set(bool(cfg.modifier & HID_MOD_LALT))
-            self.mod_lwin.set(bool(cfg.modifier & HID_MOD_LGUI))
-            key_name = HID_KEY_NAMES.get(cfg.key_code, "")
-            if key_name:
-                self.key_var.set(key_name)
-        elif cfg.action_type == ACTION_MOUSE_BUTTON:
+        elif cfg.btn_type == BTN_TYPE_MOUSE:
             self.action_var.set("mouse")
             self._update_options()
             mouse_map = {
                 MOUSE_LEFT_CLICK: "Left Click", MOUSE_RIGHT_CLICK: "Right Click",
                 MOUSE_MIDDLE_CLICK: "Middle Click", MOUSE_BACK: "Back",
-                MOUSE_FORWARD: "Forward",
+                MOUSE_FORWARD: "Forward", MOUSE_SCROLL_UP: "Scroll Up",
+                MOUSE_SCROLL_DOWN: "Scroll Down",
             }
             self.mouse_var.set(mouse_map.get(cfg.key_code, "Left Click"))
-        elif cfg.action_type == ACTION_DPI:
+        elif cfg.btn_type == BTN_TYPE_DPI:
             self.action_var.set("dpi")
             self._update_options()
             dpi_map = {DPI_PLUS: "DPI+", DPI_MINUS: "DPI-", DPI_LOOP: "DPI Loop"}
-            for i in range(1, 9):
-                dpi_map[0x10 + i] = f"DPI Stage {i}"
             self.dpi_var.set(dpi_map.get(cfg.key_code, "DPI+"))
-        elif cfg.action_type == ACTION_MULTIMEDIA:
+        elif cfg.btn_type == BTN_TYPE_MULTIMEDIA:
             self.action_var.set("media")
             self._update_options()
-        elif cfg.action_type == ACTION_DISABLED:
-            self.action_var.set("disabled")
-            self._update_options()
         else:
-            self.action_var.set("default")
+            self.action_var.set("disabled")
             self._update_options()
 
     def _get_modifier(self):
@@ -431,36 +375,31 @@ class ButtonAssignmentDialog(tk.Toplevel):
     def _ok(self):
         action = self.action_var.get()
 
-        if action in ("keyboard", "combo"):
+        if action == "keyboard":
             key_name = self.key_var.get()
             if not key_name:
                 messagebox.showwarning("No Key", "Please select a key.", parent=self)
                 return
             hid_code = HID_NAME_TO_CODE.get(key_name, 0)
             modifier = self._get_modifier()
-            act_type = ACTION_KEYBOARD if action == "keyboard" else ACTION_COMBO_KEY
-            self.result = ButtonConfig(act_type, modifier, hid_code)
+            self.result = ButtonConfig.keyboard_key(hid_code, modifier)
 
         elif action == "mouse":
             mouse_map = {
                 "Left Click": MOUSE_LEFT_CLICK, "Right Click": MOUSE_RIGHT_CLICK,
                 "Middle Click": MOUSE_MIDDLE_CLICK, "Back": MOUSE_BACK,
-                "Forward": MOUSE_FORWARD,
+                "Forward": MOUSE_FORWARD, "Scroll Up": MOUSE_SCROLL_UP,
+                "Scroll Down": MOUSE_SCROLL_DOWN,
             }
             code = mouse_map.get(self.mouse_var.get(), MOUSE_LEFT_CLICK)
-            self.result = ButtonConfig(ACTION_MOUSE_BUTTON, 0, code)
+            self.result = ButtonConfig.mouse_button(code)
 
         elif action == "dpi":
             dpi_map = {"DPI+": DPI_PLUS, "DPI-": DPI_MINUS, "DPI Loop": DPI_LOOP}
-            for i in range(1, 9):
-                dpi_map[f"DPI Stage {i}"] = 0x10 + i
             code = dpi_map.get(self.dpi_var.get(), DPI_PLUS)
-            self.result = ButtonConfig(ACTION_DPI, 0, code)
+            self.result = ButtonConfig.dpi(code)
 
         elif action == "media":
-            from mx3100_protocol import (MEDIA_PLAY_PAUSE, MEDIA_STOP, MEDIA_NEXT,
-                                          MEDIA_PREV, MEDIA_VOLUME_UP,
-                                          MEDIA_VOLUME_DOWN, MEDIA_MUTE)
             media_map = {
                 "Play/Pause": MEDIA_PLAY_PAUSE, "Stop": MEDIA_STOP,
                 "Next Track": MEDIA_NEXT, "Previous Track": MEDIA_PREV,
@@ -468,12 +407,10 @@ class ButtonAssignmentDialog(tk.Toplevel):
                 "Mute": MEDIA_MUTE,
             }
             code = media_map.get(self.media_var.get(), MEDIA_PLAY_PAUSE)
-            self.result = ButtonConfig(ACTION_MULTIMEDIA, 0, code & 0xFF, (code >> 8) & 0xFF)
+            self.result = ButtonConfig.multimedia(code)
 
         elif action == "disabled":
             self.result = ButtonConfig.disabled()
-        else:
-            self.result = ButtonConfig.default()
 
         self.destroy()
 
@@ -726,21 +663,17 @@ class MX3100App(tk.Tk):
             self.status_var.set("Reading configuration from mouse...")
             self.update()
             with MX3100Device() as dev:
-                buttons = read_buttons_from_device(dev, self.current_profile)
+                buttons = read_buttons_from_device(dev)
                 if buttons:
                     self.buttons.update(buttons)
                     self._refresh_button_list()
                     self.status_var.set("Configuration read from mouse")
                 else:
-                    self.status_var.set("Read completed but no valid button data received")
-                    messagebox.showinfo(
-                        "Protocol Note",
-                        "The read completed but returned empty data.\n\n"
-                        "This may mean the protocol format needs adjustment. "
-                        "Please run the HID Sniffer (Tools > HID Sniffer) "
-                        "with the original software to discover the correct "
-                        "report format, then update the REPORT_ID_CONFIG and "
-                        "CMD_* constants in mx3100_tool.py."
+                    self.status_var.set("Read completed but no button data received")
+                    messagebox.showwarning(
+                        "Read Failed",
+                        "Could not read button data from mouse.\n\n"
+                        "Make sure you're running as Administrator."
                     )
         except IOError as e:
             self.status_var.set(f"Read failed: {e}")
@@ -758,7 +691,7 @@ class MX3100App(tk.Tk):
             self.status_var.set("Writing configuration to mouse...")
             self.update()
             with MX3100Device() as dev:
-                write_buttons_to_device(dev, self.current_profile, self.buttons)
+                write_buttons_to_device(dev, self.buttons)
                 self.status_var.set("Configuration written to mouse successfully!")
                 messagebox.showinfo("Success",
                                     "Button assignments written to mouse!\n\n"
@@ -845,9 +778,14 @@ def cli_assign(button_idx, key_name, modifier_str=""):
 
     try:
         with MX3100Device() as dev:
-            buttons = dict(DEFAULT_BUTTONS)
+            # Read current config first
+            print("Reading current config...")
+            buttons = read_buttons_from_device(dev)
+            if not buttons:
+                buttons = dict(DEFAULT_BUTTONS)
             buttons[button_idx] = cfg
-            write_buttons_to_device(dev, 0, buttons)
+            print("Writing updated config...")
+            write_buttons_to_device(dev, buttons)
             print("Done!")
     except IOError as e:
         print(f"ERROR: {e}")
@@ -857,9 +795,29 @@ def cli_list_keys():
     print("Available keys (including F13-F24):\n")
     keys = get_all_assignable_keys()
     for name, code in keys:
-        marker = " ★" if name.startswith("F") and name[1:].isdigit() and int(name[1:]) >= 13 else ""
+        marker = " *NEW*" if name.startswith("F") and name[1:].isdigit() and int(name[1:]) >= 13 else ""
         print(f"  {name:<15} (HID 0x{code:02X}){marker}")
-    print("\n★ = F13-F24 (newly supported)")
+    print("\n*NEW* = F13-F24 (newly supported)")
+
+
+def cli_read():
+    """Read and display current button assignments from mouse."""
+    print("Reading button assignments from mouse...")
+    try:
+        with MX3100Device() as dev:
+            buttons = read_buttons_from_device(dev)
+            if not buttons:
+                print("ERROR: Could not read button data.")
+                return
+            print(f"\nCurrent button assignments ({len(buttons)} buttons):\n")
+            for btn_idx in range(TOTAL_BUTTONS):
+                name = BUTTON_NAMES.get(btn_idx, f"Button {btn_idx}")
+                cfg = buttons.get(btn_idx, ButtonConfig.disabled())
+                raw = cfg.to_bytes()
+                hex_str = " ".join(f"{b:02X}" for b in raw)
+                print(f"  [{btn_idx:2d}] {name:<30} {cfg.describe():<25} [{hex_str}]")
+    except IOError as e:
+        print(f"ERROR: {e}")
 
 
 def main():
@@ -870,6 +828,8 @@ def main():
                         help="Use command-line mode (no GUI)")
     parser.add_argument("--detect", action="store_true",
                         help="Just detect the mouse and exit")
+    parser.add_argument("--read", action="store_true",
+                        help="Read and display current button assignments")
     parser.add_argument("--assign", nargs=2, metavar=("BUTTON", "KEY"),
                         help="Assign a key to a button (e.g. --assign 7 F13)")
     parser.add_argument("--modifier", type=str, default="",
@@ -887,6 +847,8 @@ def main():
         cli_detect()
     elif args.list_keys:
         cli_list_keys()
+    elif args.read:
+        cli_read()
     elif args.assign:
         btn_idx = int(args.assign[0])
         key_name = args.assign[1]

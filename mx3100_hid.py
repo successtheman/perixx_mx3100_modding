@@ -26,6 +26,7 @@ GENERIC_WRITE = 0x40000000
 FILE_SHARE_READ = 0x01
 FILE_SHARE_WRITE = 0x02
 OPEN_EXISTING = 3
+FILE_FLAG_OVERLAPPED = 0x40000000
 INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 
 
@@ -53,6 +54,16 @@ class SP_DEVICE_INTERFACE_DATA(ctypes.Structure):
         ("InterfaceClassGuid", GUID),
         ("Flags", ctypes.c_ulong),
         ("Reserved", ctypes.POINTER(ctypes.c_ulong)),
+    ]
+
+
+class OVERLAPPED(ctypes.Structure):
+    _fields_ = [
+        ("Internal", ctypes.c_void_p),
+        ("InternalHigh", ctypes.c_void_p),
+        ("Offset", wintypes.DWORD),
+        ("OffsetHigh", wintypes.DWORD),
+        ("hEvent", ctypes.c_void_p),
     ]
 
 
@@ -117,6 +128,18 @@ _kernel32.ReadFile.argtypes = [
     ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p
 ]
 
+_kernel32.CreateEventW.restype = ctypes.c_void_p
+_kernel32.CreateEventW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.BOOL, ctypes.c_wchar_p]
+_kernel32.WaitForSingleObject.restype = wintypes.DWORD
+_kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, wintypes.DWORD]
+_kernel32.GetOverlappedResult.restype = wintypes.BOOL
+_kernel32.GetOverlappedResult.argtypes = [
+    ctypes.c_void_p, ctypes.POINTER(OVERLAPPED),
+    ctypes.POINTER(wintypes.DWORD), wintypes.BOOL
+]
+_kernel32.CancelIo.restype = wintypes.BOOL
+_kernel32.CancelIo.argtypes = [ctypes.c_void_p]
+
 _hid.HidD_GetHidGuid.argtypes = [ctypes.POINTER(GUID)]
 _hid.HidD_GetAttributes.restype = wintypes.BOOL
 _hid.HidD_GetAttributes.argtypes = [ctypes.c_void_p, ctypes.POINTER(HIDD_ATTRIBUTES)]
@@ -144,14 +167,15 @@ def _get_hid_guid():
     return guid
 
 
-def _open_device(path):
+def _open_device(path, overlapped=False):
+    flags = FILE_FLAG_OVERLAPPED if overlapped else 0
     handle = _kernel32.CreateFileW(
         path,
         GENERIC_READ | GENERIC_WRITE,
         FILE_SHARE_READ | FILE_SHARE_WRITE,
         None,
         OPEN_EXISTING,
-        0,
+        flags,
         None,
     )
     if handle is None or handle == INVALID_HANDLE_VALUE:
@@ -237,7 +261,13 @@ def enumerate_devices():
 
 
 class MX3100Device:
-    """HID interface to the Perixx MX-3100 gaming mouse."""
+    """HID interface to the Perixx MX-3100 gaming mouse.
+
+    Opens with FILE_FLAG_OVERLAPPED for proper data read/write support.
+    Provides methods matching the pzl/mx3100drv protocol:
+      send_feature / read_feature  (9-byte feature reports for commands)
+      write_data / read_data       (64-byte output/input reports for data)
+    """
 
     def __init__(self, path=None):
         self.handle = None
@@ -254,7 +284,7 @@ class MX3100Device:
             self.path = path
 
         if self.path:
-            self.handle = _open_device(self.path)
+            self.handle = _open_device(self.path, overlapped=True)
             if self.handle is None:
                 raise IOError(f"Cannot open device at {self.path}")
             caps = _get_device_caps(self.handle)
@@ -288,7 +318,7 @@ class MX3100Device:
         self.input_report_len = best[4]
         self.output_report_len = best[5]
 
-        self.handle = _open_device(self.path)
+        self.handle = _open_device(self.path, overlapped=True)
         if self.handle is None:
             raise IOError(f"Cannot open device at {self.path}")
 
@@ -297,56 +327,103 @@ class MX3100Device:
             _close_device(self.handle)
             self.handle = None
 
+    # ── Feature reports (9-byte command channel) ────────────────────────────
+
+    def send_feature(self, cmd_8bytes):
+        """Send a 9-byte feature report: [ReportID=0x00] + cmd[8]."""
+        if not self.handle:
+            raise IOError("Device not open")
+        buf = (ctypes.c_ubyte * 9)(0, *cmd_8bytes[:8])
+        if not _hid.HidD_SetFeature(self.handle, buf, 9):
+            raise IOError(f"HidD_SetFeature failed (error {ctypes.get_last_error()})")
+
+    def read_feature(self):
+        """Read a 9-byte feature report, return 8-byte command payload."""
+        if not self.handle:
+            raise IOError("Device not open")
+        buf = (ctypes.c_ubyte * 9)(0)
+        if not _hid.HidD_GetFeature(self.handle, buf, 9):
+            raise IOError(f"HidD_GetFeature failed (error {ctypes.get_last_error()})")
+        return list(buf)[1:]  # Strip report ID
+
+    # ── Data reports (64-byte data channel, overlapped I/O) ─────────────────
+
+    def write_data(self, data_64bytes):
+        """Write a 65-byte output report (ReportID=0x00 + 64 bytes data)."""
+        if not self.handle:
+            raise IOError("Device not open")
+        buf = (ctypes.c_ubyte * 65)(0, *data_64bytes[:64])
+        written = wintypes.DWORD(0)
+        ovl = OVERLAPPED()
+        evt = _kernel32.CreateEventW(None, True, False, None)
+        ovl.hEvent = evt
+        try:
+            r = _kernel32.WriteFile(self.handle, buf, 65,
+                                    ctypes.byref(written), ctypes.byref(ovl))
+            if not r:
+                err = ctypes.get_last_error()
+                if err == 997:  # ERROR_IO_PENDING
+                    wait = _kernel32.WaitForSingleObject(evt, 2000)
+                    if wait != 0:
+                        _kernel32.CancelIo(self.handle)
+                        raise IOError("write_data timed out")
+                    _kernel32.GetOverlappedResult(
+                        self.handle, ctypes.byref(ovl),
+                        ctypes.byref(written), True)
+                else:
+                    raise IOError(f"WriteFile failed (error {err})")
+        finally:
+            _kernel32.CloseHandle(evt)
+
+    def read_data(self, timeout_ms=2000):
+        """Read a 64-byte input report with timeout. Returns list of 64 bytes."""
+        if not self.handle:
+            raise IOError("Device not open")
+        buf = (ctypes.c_ubyte * 65)()
+        rd = wintypes.DWORD(0)
+        ovl = OVERLAPPED()
+        evt = _kernel32.CreateEventW(None, True, False, None)
+        ovl.hEvent = evt
+        try:
+            r = _kernel32.ReadFile(self.handle, buf, 65,
+                                   ctypes.byref(rd), ctypes.byref(ovl))
+            if not r:
+                err = ctypes.get_last_error()
+                if err == 997:  # ERROR_IO_PENDING
+                    wait = _kernel32.WaitForSingleObject(evt, timeout_ms)
+                    if wait != 0:
+                        _kernel32.CancelIo(self.handle)
+                        return None
+                    _kernel32.GetOverlappedResult(
+                        self.handle, ctypes.byref(ovl),
+                        ctypes.byref(rd), True)
+                else:
+                    raise IOError(f"ReadFile failed (error {err})")
+            return list(buf[1:65])  # Strip report ID byte
+        finally:
+            _kernel32.CloseHandle(evt)
+
+    # ── Legacy methods (kept for compatibility) ─────────────────────────────
+
     def set_feature(self, data):
-        """Send a HID Feature Report to the device."""
+        """Send a raw HID Feature Report."""
         if not self.handle:
             raise IOError("Device not open")
         buf = (ctypes.c_ubyte * len(data))(*data)
-        result = _hid.HidD_SetFeature(self.handle, buf, len(data))
-        if not result:
+        if not _hid.HidD_SetFeature(self.handle, buf, len(data)):
             raise IOError(f"HidD_SetFeature failed (error {ctypes.get_last_error()})")
-        return True
 
     def get_feature(self, report_id, length=None):
-        """Read a HID Feature Report from the device."""
+        """Read a raw HID Feature Report."""
         if not self.handle:
             raise IOError("Device not open")
         if length is None:
             length = self.feature_report_len
         buf = (ctypes.c_ubyte * length)()
         buf[0] = report_id
-        result = _hid.HidD_GetFeature(self.handle, buf, length)
-        if not result:
+        if not _hid.HidD_GetFeature(self.handle, buf, length):
             raise IOError(f"HidD_GetFeature failed (error {ctypes.get_last_error()})")
         return list(buf)
-
-    def write_output(self, data):
-        """Send an HID Output Report via WriteFile."""
-        if not self.handle:
-            raise IOError("Device not open")
-        buf = (ctypes.c_ubyte * len(data))(*data)
-        written = wintypes.DWORD(0)
-        result = _kernel32.WriteFile(
-            self.handle, buf, len(data), ctypes.byref(written), None
-        )
-        if not result:
-            raise IOError(f"WriteFile failed (error {ctypes.get_last_error()})")
-        return written.value
-
-    def read_input(self, length=None, timeout_ms=1000):
-        """Read an HID Input Report via ReadFile."""
-        if not self.handle:
-            raise IOError("Device not open")
-        if length is None:
-            length = self.input_report_len
-        buf = (ctypes.c_ubyte * length)()
-        read_count = wintypes.DWORD(0)
-        result = _kernel32.ReadFile(
-            self.handle, buf, length, ctypes.byref(read_count), None
-        )
-        if not result:
-            raise IOError(f"ReadFile failed (error {ctypes.get_last_error()})")
-        return list(buf[:read_count.value])
 
     def __enter__(self):
         self.open()
