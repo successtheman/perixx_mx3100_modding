@@ -196,6 +196,7 @@ class ButtonAssignmentDialog(tk.Toplevel):
         self.action_var = tk.StringVar(value="keyboard")
         actions = [
             ("Keyboard Key", "keyboard"),
+            ("Keyboard Combo (Modifier + Key)", "combo"),
             ("Mouse Button", "mouse"),
             ("DPI Control", "dpi"),
             ("Multimedia", "media"),
@@ -284,6 +285,52 @@ class ButtonAssignmentDialog(tk.Toplevel):
         ttk.Label(fkey_frame, text="(Green = F13-F24, newly supported!)",
                   foreground="green").pack(anchor="w")
 
+    def _build_combo_options(self):
+        self._clear_options()
+
+        ttk.Label(self.options_frame,
+                  text="Select modifier(s) + key to send simultaneously.",
+                  wraplength=400).pack(pady=(0, 5))
+
+        # Modifiers
+        mod_frame = ttk.Frame(self.options_frame)
+        mod_frame.pack(fill="x", pady=2)
+        ttk.Label(mod_frame, text="Modifiers:").pack(side="left")
+
+        self.mod_lctrl = tk.BooleanVar(value=True)
+        self.mod_lshift = tk.BooleanVar()
+        self.mod_lalt = tk.BooleanVar()
+        self.mod_lwin = tk.BooleanVar()
+
+        ttk.Checkbutton(mod_frame, text="Ctrl", variable=self.mod_lctrl).pack(side="left", padx=3)
+        ttk.Checkbutton(mod_frame, text="Shift", variable=self.mod_lshift).pack(side="left", padx=3)
+        ttk.Checkbutton(mod_frame, text="Alt", variable=self.mod_lalt).pack(side="left", padx=3)
+        ttk.Checkbutton(mod_frame, text="Win", variable=self.mod_lwin).pack(side="left", padx=3)
+
+        # Key selection
+        key_frame = ttk.Frame(self.options_frame)
+        key_frame.pack(fill="x", pady=5)
+        ttk.Label(key_frame, text="Key:").pack(side="left")
+
+        self.key_var = tk.StringVar()
+        all_keys = get_all_assignable_keys()
+        key_names = [name for name, _ in all_keys]
+
+        self.key_combo = ttk.Combobox(key_frame, textvariable=self.key_var,
+                                       values=key_names, state="readonly", width=20)
+        self.key_combo.pack(side="left", padx=5)
+
+        # Quick F-key buttons
+        fkey_frame = ttk.LabelFrame(self.options_frame, text="Quick Select", padding=5)
+        fkey_frame.pack(fill="x", pady=5)
+        row = ttk.Frame(fkey_frame)
+        row.pack(fill="x")
+        for n in range(13, 25):
+            btn = tk.Button(row, text=f"F{n}", width=4, bg="#4CAF50", fg="white",
+                            activebackground="#66BB6A", font=("", 8, "bold"),
+                            command=lambda n=n: self.key_var.set(f"F{n}"))
+            btn.pack(side="left", padx=1, pady=1)
+
     def _build_mouse_options(self):
         self._clear_options()
         self.mouse_var = tk.StringVar(value="Left Click")
@@ -318,6 +365,8 @@ class ButtonAssignmentDialog(tk.Toplevel):
         action = self.action_var.get()
         if action == "keyboard":
             self._build_keyboard_options()
+        elif action == "combo":
+            self._build_combo_options()
         elif action == "mouse":
             self._build_mouse_options()
         elif action == "dpi":
@@ -333,7 +382,11 @@ class ButtonAssignmentDialog(tk.Toplevel):
             self.action_var.set("disabled")
             self._update_options()
         elif cfg.btn_type == BTN_TYPE_KEYBOARD:
-            self.action_var.set("keyboard")
+            # Show as combo if modifiers are set, plain keyboard otherwise
+            if cfg.modifier:
+                self.action_var.set("combo")
+            else:
+                self.action_var.set("keyboard")
             self._update_options()
             self.mod_lctrl.set(bool(cfg.modifier & HID_MOD_LCTRL))
             self.mod_lshift.set(bool(cfg.modifier & HID_MOD_LSHIFT))
@@ -375,7 +428,7 @@ class ButtonAssignmentDialog(tk.Toplevel):
     def _ok(self):
         action = self.action_var.get()
 
-        if action == "keyboard":
+        if action in ("keyboard", "combo"):
             key_name = self.key_var.get()
             if not key_name:
                 messagebox.showwarning("No Key", "Please select a key.", parent=self)
