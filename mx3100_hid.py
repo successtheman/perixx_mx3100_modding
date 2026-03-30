@@ -26,7 +26,7 @@ GENERIC_WRITE = 0x40000000
 FILE_SHARE_READ = 0x01
 FILE_SHARE_WRITE = 0x02
 OPEN_EXISTING = 3
-INVALID_HANDLE_VALUE = wintypes.HANDLE(-1).value
+INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 
 
 class GUID(ctypes.Structure):
@@ -77,6 +77,61 @@ class HIDP_CAPS(ctypes.Structure):
     ]
 
 
+# ─── 64-bit safe function signatures ─────────────────────────────────────────
+# Without explicit restype/argtypes, ctypes defaults to c_int (32-bit) for
+# return values and arguments. On 64-bit Windows, HANDLE values are 8 bytes,
+# so the default truncates them, causing all subsequent API calls to fail.
+
+_setupapi.SetupDiGetClassDevsW.restype = ctypes.c_void_p
+_setupapi.SetupDiGetClassDevsW.argtypes = [
+    ctypes.POINTER(GUID), ctypes.c_wchar_p, ctypes.c_void_p, wintypes.DWORD
+]
+_setupapi.SetupDiEnumDeviceInterfaces.restype = wintypes.BOOL
+_setupapi.SetupDiEnumDeviceInterfaces.argtypes = [
+    ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(GUID),
+    wintypes.DWORD, ctypes.POINTER(SP_DEVICE_INTERFACE_DATA)
+]
+_setupapi.SetupDiGetDeviceInterfaceDetailW.restype = wintypes.BOOL
+_setupapi.SetupDiGetDeviceInterfaceDetailW.argtypes = [
+    ctypes.c_void_p, ctypes.POINTER(SP_DEVICE_INTERFACE_DATA),
+    ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p
+]
+_setupapi.SetupDiDestroyDeviceInfoList.restype = wintypes.BOOL
+_setupapi.SetupDiDestroyDeviceInfoList.argtypes = [ctypes.c_void_p]
+
+_kernel32.CreateFileW.restype = ctypes.c_void_p
+_kernel32.CreateFileW.argtypes = [
+    wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+    ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p
+]
+_kernel32.CloseHandle.restype = wintypes.BOOL
+_kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+_kernel32.WriteFile.restype = wintypes.BOOL
+_kernel32.WriteFile.argtypes = [
+    ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD,
+    ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p
+]
+_kernel32.ReadFile.restype = wintypes.BOOL
+_kernel32.ReadFile.argtypes = [
+    ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD,
+    ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p
+]
+
+_hid.HidD_GetHidGuid.argtypes = [ctypes.POINTER(GUID)]
+_hid.HidD_GetAttributes.restype = wintypes.BOOL
+_hid.HidD_GetAttributes.argtypes = [ctypes.c_void_p, ctypes.POINTER(HIDD_ATTRIBUTES)]
+_hid.HidD_GetPreparsedData.restype = wintypes.BOOL
+_hid.HidD_GetPreparsedData.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+_hid.HidP_GetCaps.restype = ctypes.c_long
+_hid.HidP_GetCaps.argtypes = [ctypes.c_void_p, ctypes.POINTER(HIDP_CAPS)]
+_hid.HidD_FreePreparsedData.restype = wintypes.BOOL
+_hid.HidD_FreePreparsedData.argtypes = [ctypes.c_void_p]
+_hid.HidD_SetFeature.restype = wintypes.BOOL
+_hid.HidD_SetFeature.argtypes = [ctypes.c_void_p, ctypes.c_void_p, wintypes.ULONG]
+_hid.HidD_GetFeature.restype = wintypes.BOOL
+_hid.HidD_GetFeature.argtypes = [ctypes.c_void_p, ctypes.c_void_p, wintypes.ULONG]
+
+
 # ─── Device constants ────────────────────────────────────────────────────────
 
 VID = 0x04D9
@@ -99,13 +154,13 @@ def _open_device(path):
         0,
         None,
     )
-    if handle == INVALID_HANDLE_VALUE:
+    if handle is None or handle == INVALID_HANDLE_VALUE:
         return None
     return handle
 
 
 def _close_device(handle):
-    if handle and handle != INVALID_HANDLE_VALUE:
+    if handle is not None and handle != INVALID_HANDLE_VALUE:
         _kernel32.CloseHandle(handle)
 
 
@@ -126,7 +181,7 @@ def enumerate_devices():
     dev_info = _setupapi.SetupDiGetClassDevsW(
         ctypes.byref(guid), None, None, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE
     )
-    if dev_info == INVALID_HANDLE_VALUE:
+    if dev_info is None or dev_info == INVALID_HANDLE_VALUE:
         return []
 
     results = []
@@ -188,6 +243,8 @@ class MX3100Device:
         self.handle = None
         self.path = path
         self.feature_report_len = 0
+        self.input_report_len = 0
+        self.output_report_len = 0
         self.usage_page = 0
         self.usage = 0
 
@@ -203,11 +260,13 @@ class MX3100Device:
             caps = _get_device_caps(self.handle)
             if caps:
                 self.feature_report_len = caps.FeatureReportByteLength
+                self.input_report_len = caps.InputReportByteLength
+                self.output_report_len = caps.OutputReportByteLength
                 self.usage_page = caps.UsagePage
                 self.usage = caps.Usage
             return
 
-        # Auto-detect: find the interface that supports feature reports
+        # Auto-detect: find the vendor-specific config interface (UsagePage 0xFF00+)
         devices = enumerate_devices()
         if not devices:
             raise IOError(
@@ -215,12 +274,19 @@ class MX3100Device:
                 "software is using it."
             )
 
-        # Prefer the interface with the largest feature report (that's the config one)
-        best = max(devices, key=lambda d: d[3])
+        # Prefer vendor-specific interface (UsagePage >= 0xFF00) with output reports
+        vendor_devs = [d for d in devices if d[1] >= 0xFF00 and d[5] > 0]
+        if vendor_devs:
+            best = vendor_devs[0]
+        else:
+            # Fallback: largest feature report
+            best = max(devices, key=lambda d: d[3])
         self.path = best[0]
         self.usage_page = best[1]
         self.usage = best[2]
         self.feature_report_len = best[3]
+        self.input_report_len = best[4]
+        self.output_report_len = best[5]
 
         self.handle = _open_device(self.path)
         if self.handle is None:
@@ -253,6 +319,34 @@ class MX3100Device:
         if not result:
             raise IOError(f"HidD_GetFeature failed (error {ctypes.get_last_error()})")
         return list(buf)
+
+    def write_output(self, data):
+        """Send an HID Output Report via WriteFile."""
+        if not self.handle:
+            raise IOError("Device not open")
+        buf = (ctypes.c_ubyte * len(data))(*data)
+        written = wintypes.DWORD(0)
+        result = _kernel32.WriteFile(
+            self.handle, buf, len(data), ctypes.byref(written), None
+        )
+        if not result:
+            raise IOError(f"WriteFile failed (error {ctypes.get_last_error()})")
+        return written.value
+
+    def read_input(self, length=None, timeout_ms=1000):
+        """Read an HID Input Report via ReadFile."""
+        if not self.handle:
+            raise IOError("Device not open")
+        if length is None:
+            length = self.input_report_len
+        buf = (ctypes.c_ubyte * length)()
+        read_count = wintypes.DWORD(0)
+        result = _kernel32.ReadFile(
+            self.handle, buf, length, ctypes.byref(read_count), None
+        )
+        if not result:
+            raise IOError(f"ReadFile failed (error {ctypes.get_last_error()})")
+        return list(buf[:read_count.value])
 
     def __enter__(self):
         self.open()

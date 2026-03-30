@@ -6,6 +6,9 @@ __pycache__/
 # Extracted installer contents (large binaries)
 extracted/
 MX-3100_Driver/
+MX-3100_Driver_extracted/
+*.zip
+*.exe
 
 # User profiles
 profiles/
